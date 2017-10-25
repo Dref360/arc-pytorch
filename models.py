@@ -1,8 +1,11 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-import math
+
+from clstm import CLSTM_cell
 
 use_cuda = False
 
@@ -166,7 +169,7 @@ class ARC(nn.Module):
 
     """
 
-    def __init__(self, num_glimpses: int=8, glimpse_h: int=8, glimpse_w: int=8, controller_out: int=128) -> None:
+    def __init__(self, num_glimpses: int = 8, glimpse_h: int = 8, glimpse_w: int = 8, controller_out: int = 128) -> None:
         super().__init__()
 
         self.num_glimpses = num_glimpses
@@ -176,8 +179,9 @@ class ARC(nn.Module):
 
         # main modules of ARC
 
-        self.controller = nn.LSTMCell(input_size=(glimpse_h * glimpse_w), hidden_size=self.controller_out)
-        self.glimpser = nn.Linear(in_features=self.controller_out, out_features=3)
+        # self.controller = nn.LSTMCell(input_size=( glimpse_h * glimpse_w), hidden_size=self.controller_out)
+        self.controller = CLSTM_cell([glimpse_h, glimpse_w], 1, 3, self.controller_out, use_cuda)
+        self.glimpser = nn.Conv2d(in_channels=self.controller_out, out_channels=3, kernel_size=(glimpse_h, glimpse_w))
 
         # this will actually generate glimpses from images using the glimpse parameters.
         self.glimpse_window = GlimpseWindow(glimpse_h=self.glimpse_h, glimpse_w=self.glimpse_w)
@@ -187,7 +191,7 @@ class ARC(nn.Module):
         The method calls the internal _forward() method which returns hidden states for all time steps. This i
 
         Args:
-            image_pairs (B, 2, h, w):  A batch of pairs of images
+            image_pairs (B, 3, h, w):  A batch of pairs of images
 
         Returns:
             (B, controller_out): A batch of final hidden states after each pair of image has been shown for num_glimpses
@@ -224,21 +228,20 @@ class ARC(nn.Module):
         all_hidden = []
 
         # initial hidden state of the LSTM.
-        Hx = Variable(torch.zeros(batch_size, self.controller_out))  # (B, controller_out)
-        Cx = Variable(torch.zeros(batch_size, self.controller_out))  # (B, controller_out)
+        Hx, Cx = self.controller.init_hidden(batch_size)
 
         if use_cuda:
             Hx, Cx = Hx.cuda(), Cx.cuda()
 
         # take `num_glimpses` glimpses for both images, alternatingly.
-        for turn in range(2*self.num_glimpses):
+        for turn in range(self.num_glimpses):
             # select image to show, alternate between the first and second image in the pair
-            images_to_observe = image_pairs[:,  turn % 2]  # (B, h, w)
+            images_to_observe = image_pairs  # (B, 3, h, w)
 
             # choose a portion from image to glimpse using attention
-            glimpse_params = torch.tanh(self.glimpser(Hx))  # (B, 3)  a batch of glimpse params (x, y, delta)
+            glimpse_params = torch.tanh(self.glimpser(Hx)).view(batch_size, 3)  # (B, 3)  a batch of glimpse params (x, y, delta)
             glimpses = self.glimpse_window.get_glimpse(images_to_observe, glimpse_params)  # (B, glimpse_h, glimpse_w)
-            flattened_glimpses = glimpses.view(batch_size, -1)  # (B, glimpse_h * glimpse_w), one time-step
+            flattened_glimpses = glimpses.view(batch_size, 1, self.glimpse_h, self.glimpse_w)  # (B, glimpse_h * glimpse_w), one time-step
 
             # feed the glimpses and the previous hidden state to the LSTM.
             Hx, Cx = self.controller(flattened_glimpses, (Hx, Cx))  # (B, controller_out), (B, controller_out)
@@ -266,7 +269,7 @@ class ArcBinaryClassifier(nn.Module):
 
     """
 
-    def __init__(self, num_glimpses: int=8, glimpse_h: int=8, glimpse_w: int=8, controller_out: int = 128):
+    def __init__(self, num_glimpses: int = 8, glimpse_h: int = 8, glimpse_w: int = 8, controller_out: int = 128):
         super().__init__()
         self.arc = ARC(
             num_glimpses=num_glimpses,
@@ -284,6 +287,45 @@ class ArcBinaryClassifier(nn.Module):
 
         d1 = F.elu(self.dense1(arc_out))
         decision = torch.sigmoid(self.dense2(d1))
+
+        return decision
+
+    def save_to_file(self, file_path: str) -> None:
+        torch.save(self.state_dict(), file_path)
+
+
+class ArcRegression(nn.Module):
+    """
+    A binary classifier that uses ARC.
+    Given a pair of images, feeds them the ARC and uses the final hidden state of ARC to
+    classify the images as belonging to the same class or not.
+
+    Args:
+        num_glimpses (int): How many glimpses must the ARC "see" before emitting the final hidden state.
+        glimpse_h (int): The height of the glimpse in pixels.
+        glimpse_w (int): The width of the glimpse in pixels.
+        controller_out (int): The size of the hidden state emitted by the controller.
+
+    """
+
+    def __init__(self, num_glimpses: int = 8, glimpse_h: int = 8, glimpse_w: int = 8, controller_out: int = 128):
+        super().__init__()
+        self.arc = ARC(
+            num_glimpses=num_glimpses,
+            glimpse_h=glimpse_h,
+            glimpse_w=glimpse_w,
+            controller_out=controller_out)
+
+        # two dense layers, which take the hidden state from the controller of ARC and
+        # classify the images as belonging to the same class or not.
+        self.dense1 = nn.Linear(controller_out, 64)
+        self.dense2 = nn.Linear(64, 4)
+
+    def forward(self, image_pairs: Variable) -> Variable:
+        arc_out = self.arc(image_pairs)
+
+        d1 = F.elu(self.dense1(arc_out))
+        decision = torch.abs(self.dense2(d1))
 
         return decision
 

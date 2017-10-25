@@ -5,17 +5,18 @@ from torch.autograd import Variable
 from datetime import datetime, timedelta
 
 import batcher
-from batcher import Batcher
+import batcher_mio
 import models
-from models import ArcBinaryClassifier
+from models import ArcBinaryClassifier, ArcRegression
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--batchSize', type=int, default=128, help='input batch size')
-parser.add_argument('--imageSize', type=int, default=32, help='the height / width of the input image to ARC')
-parser.add_argument('--glimpseSize', type=int, default=8, help='the height / width of glimpse seen by ARC')
+parser.add_argument('--path', type=str, help='input batch size')
+parser.add_argument('--imageSize', type=int, default=128, help='the height / width of the input image to ARC')
+parser.add_argument('--glimpseSize', type=int, default=32, help='the height / width of glimpse seen by ARC')
 parser.add_argument('--numStates', type=int, default=128, help='number of hidden states in ARC controller')
-parser.add_argument('--numGlimpses', type=int, default=6, help='the number glimpses of each image in pair seen by ARC')
+parser.add_argument('--numGlimpses', type=int, default=16, help='the number glimpses of each image in pair seen by ARC')
 parser.add_argument('--lr', type=float, default=0.0002, help='learning rate, default=0.0002')
 parser.add_argument('--cuda', action='store_true', help='enables cuda')
 parser.add_argument('--name', default=None, help='Custom name for this configuration. Needed for saving'
@@ -36,6 +37,7 @@ def train():
 
     if opt.cuda:
         batcher.use_cuda = True
+        batcher_mio.use_cuda = True
         models.use_cuda = True
 
     if opt.name is None:
@@ -51,7 +53,7 @@ def train():
     os.makedirs(models_path, exist_ok=True)
 
     # initialise the model
-    discriminator = ArcBinaryClassifier(num_glimpses=opt.numGlimpses,
+    discriminator = ArcRegression(num_glimpses=opt.numGlimpses,
                                         glimpse_h=opt.glimpseSize,
                                         glimpse_w=opt.glimpseSize,
                                         controller_out=opt.numStates)
@@ -64,20 +66,20 @@ def train():
         discriminator.load_state_dict(torch.load(os.path.join(models_path, opt.load)))
 
     # set up the optimizer.
-    bce = torch.nn.BCELoss()
+    bce = torch.nn.MSELoss()
     if opt.cuda:
         bce = bce.cuda()
 
     optimizer = torch.optim.Adam(params=discriminator.parameters(), lr=opt.lr)
 
     # load the dataset in memory.
-    loader = Batcher(batch_size=opt.batchSize, image_size=opt.imageSize)
+    loader = batcher_mio.MioLocalization(path=opt.path, batch_size=opt.batchSize, image_size=opt.imageSize)
 
     # ready to train ...
     best_validation_loss = None
     saving_threshold = 1.02
     last_saved = datetime.utcnow()
-    save_every = timedelta(minutes=10)
+    save_every = timedelta(minutes=60)
 
     i = -1
     while True:
@@ -85,9 +87,11 @@ def train():
 
         X, Y = loader.fetch_batch("train")
         pred = discriminator(X)
+        print("GOOD")
+        exit(0)
         loss = bce(pred, Y.float())
 
-        if i % 10 == 0:
+        if i % (len(loader.X_train) // opt.batchSize) == 0:
 
             # validate your model
             X_val, Y_val = loader.fetch_batch("val")
@@ -97,8 +101,8 @@ def train():
             training_loss = loss.data[0]
             validation_loss = loss_val.data[0]
 
-            print("Iteration: {} \t Train: Acc={}%, Loss={} \t\t Validation: Acc={}%, Loss={}".format(
-                i, get_pct_accuracy(pred, Y), training_loss, get_pct_accuracy(pred_val, Y_val), validation_loss
+            print("Iteration: {} \t Train: Loss={} \t\t Validation: Loss={}".format(
+                i, training_loss, validation_loss
             ))
 
             if best_validation_loss is None:
